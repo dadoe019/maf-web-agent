@@ -14,7 +14,7 @@ openai>=1.30.0  # For OpenRouter/Grok integration
 anthropic>=0.40.0  # Fallback
 
 # Browser Automation via MCP
-playwright==1.49.0
+# (Playwright MCP runs as an npm package via npx)
 
 # State Management
 redis==5.2.1
@@ -45,11 +45,14 @@ pytest-cov>=4.1.0
 # Install MAF (pre-release)
 pip install --pre agent-framework==0.1.0
 
-# Install Playwright browsers
-playwright install chromium
-
-# Install browser-use for MCP
+# Install browser-use for MCP discovery helpers
 pip install browser-use
+
+# Ensure Node.js is available (Playwright MCP runs via npx)
+node --version
+
+# Validate Playwright MCP CLI is reachable
+npx -y @playwright/mcp@latest --help
 
 # Verify MAF installation
 python -c "from agent_framework import ChatAgent, MCPStdioTool; print('✅ MAF OK')"
@@ -65,6 +68,7 @@ python -c "from agent_framework import ChatAgent, MCPStdioTool; print('✅ MAF O
 ## 1. Playwright MCP (Official)
 **Status**: ✅ VERIFIED
 **Command**: `npx -y @playwright/mcp@latest`
+**Flags**: Supports `--caps=<comma list>`, `--user-data-dir <path>`
 **Package**: @playwright/mcp
 **Verification**: `npm info @playwright/mcp` - v0.1.0
 **Tools**: browser_navigate, click, fill, screenshot, etc.
@@ -113,8 +117,13 @@ agent = client.create_agent(
 ```
 
 ### Pricing:
-- Grok 4 Fast Reasoning: $0.20/1M input, $0.50/1M output
-- 10K input + 5K output = ~$0.0045
+
+| Model | Input ($/1M tokens) | Output ($/1M tokens) | Reference |
+| --- | --- | --- | --- |
+| Grok 4 Fast Reasoning | 0.20 | 0.50 | [x-ai/grok-4-fast-reasoning](https://openrouter.ai/models/x-ai/grok-4-fast-reasoning) |
+| Grok 4 Fast Non-Reasoning | 0.10 | 0.20 | [x-ai/grok-4-fast-non-reasoning](https://openrouter.ai/models/x-ai/grok-4-fast-non-reasoning) |
+
+10K input + 5K output tokens ≈ **$0.0045**.
 
 ### Fallback Strategy:
 If OpenRouter/Grok fails → Claude Sonnet 4.5 via Anthropic API
@@ -138,10 +147,12 @@ import asyncio
 import logging
 from typing import Optional, Dict, Any, List
 from datetime import datetime
+from urllib.parse import urlparse
 
 from agent_framework import ChatAgent, MCPStdioTool
 from agent_framework.openai import OpenAIChatClient
 from opentelemetry import trace
+from config.settings import settings, MCPServerSettings
 
 logger = logging.getLogger("agents.maf_web_agent")
 tracer = trace.get_tracer(__name__)
@@ -187,13 +198,15 @@ class MAFWebAgent:
         api_key: str,
         model: str = "x-ai/grok-4-fast-reasoning",
         base_url: str = "https://openrouter.ai/api/v1",
-        name: str = "WebAgent"
+        name: str = "WebAgent",
+        mcp_settings: Optional[MCPServerSettings] = None
     ):
         self.api_key = api_key
         self.model = model
         self.base_url = base_url
         self.name = name
         self.logger = logger
+        self.mcp_settings = mcp_settings or settings.mcp
         
     async def execute_task(
         self,
@@ -340,29 +353,49 @@ class MAFWebAgent:
         """
         with tracer.start_as_current_span("phase1_discovery"):
             self.logger.info("🔍 PHASE 1: Discovery (browser-use MCP)")
-            
+
+            if not self.mcp_settings.browser_use_enabled:
+                return {'success': False, 'error': 'Browser-use MCP disabled', 'cost': 0.0}
+
             async with MCPStdioTool(
                 name="browser_use",
-                command="uvx",
-                args=["browser-use", "--mcp"]
+                command=self.mcp_settings.browser_use_command,
+                args=self.mcp_settings.get_browser_use_args()
             ) as browser_use:
+                available_actions = await self._get_available_actions(browser_use)
+                navigate_action = self._choose_action(
+                    available_actions,
+                    ["browser_navigate", "navigate", "goto"]
+                )
+                state_action = self._choose_action(
+                    available_actions,
+                    ["browser_get_state", "get_state", "snapshot", "snapshot_state"]
+                )
+
+                if not navigate_action or not state_action:
+                    return {
+                        'success': False,
+                        'error': 'Browser-use MCP does not expose navigation/state actions',
+                        'cost': 0.0
+                    }
+
                 # Navigate to page
                 nav_result = await self._call_mcp_tool(
                     browser_use,
-                    "browser_navigate",
+                    navigate_action,
                     {"url": url}
                 )
-                
+
                 if not nav_result.get('success'):
                     return {'success': False, 'error': 'Navigation failed', 'cost': 0.05}
-                
+
                 # Get page state (interactive elements)
                 state_result = await self._call_mcp_tool(
                     browser_use,
-                    "browser_get_state",
+                    state_action,
                     {"include_screenshot": False}
                 )
-                
+
                 if not state_result.get('success'):
                     return {'success': False, 'error': 'Failed to get page state', 'cost': 0.05}
                 
@@ -397,49 +430,87 @@ class MAFWebAgent:
         with tracer.start_as_current_span("phase2_validation"):
             self.logger.info("✔️  PHASE 2: Validation (Playwright MCP + testing cap)")
             
+            if not self.mcp_settings.playwright_enabled:
+                return {'success': False, 'error': 'Playwright MCP disabled', 'cost': 0.0}
+
             async with MCPStdioTool(
                 name="playwright",
-                command="npx",
-                args=["-y", "@playwright/mcp@latest", "--caps=testing"]
+                command=self.mcp_settings.playwright_command,
+                args=self.mcp_settings.get_playwright_args(additional_caps=["testing"])
             ) as playwright:
+                available_actions = await self._get_available_actions(playwright)
+                navigate_action = self._choose_action(
+                    available_actions,
+                    ["browser_navigate", "navigate", "goto"]
+                )
+                get_element_action = self._choose_action(
+                    available_actions,
+                    ["get_element", "locate", "query_selector", "find_element"]
+                )
+                generate_locator_action = self._choose_action(
+                    available_actions,
+                    ["browser_generate_locator", "generate_locator", "create_locator"]
+                )
+
+                if not navigate_action or not get_element_action:
+                    return {
+                        'success': False,
+                        'error': 'Playwright MCP missing required actions',
+                        'cost': 0.0
+                    }
+
                 # Navigate
                 await self._call_mcp_tool(
                     playwright,
-                    "browser_navigate",
+                    navigate_action,
                     {"url": url}
                 )
-                
+
                 validated_steps = []
                 successes = 0
-                
+
                 # Validate each proposed selector
                 for selector_info in proposed_selectors:
                     try:
                         # Test selector
                         element_ref = await self._call_mcp_tool(
                             playwright,
-                            "get_element",
+                            get_element_action,
                             {"selector": selector_info['selector']}
                         )
-                        
-                        if element_ref.get('success'):
-                            # Generate stable locator
+
+                        if not element_ref.get('success'):
+                            continue
+
+                        action_name = self._choose_action(
+                            available_actions,
+                            self._action_candidates(selector_info['action'])
+                        )
+
+                        if not action_name:
+                            self.logger.debug(
+                                "No compatible action exposed for selector action '%s'",
+                                selector_info['action']
+                            )
+                            continue
+
+                        stable_locator = selector_info['selector']
+                        if generate_locator_action:
                             locator_result = await self._call_mcp_tool(
                                 playwright,
-                                "browser_generate_locator",
-                                {"element_ref": element_ref['ref']}
+                                generate_locator_action,
+                                {"element_ref": element_ref.get('ref')}
                             )
-                            
-                            stable_locator = locator_result.get('locator', selector_info['selector'])
-                            
-                            validated_steps.append({
-                                'action': selector_info['action'],
-                                'locator': stable_locator,
-                                'description': selector_info.get('description', '')
-                            })
-                            
-                            successes += 1
-                            
+                            stable_locator = locator_result.get('locator', stable_locator)
+
+                        validated_steps.append({
+                            'action': action_name,
+                            'locator': stable_locator,
+                            'description': selector_info.get('description', '')
+                        })
+
+                        successes += 1
+
                     except Exception as e:
                         self.logger.warning(f"Selector validation failed: {e}")
                         continue
@@ -475,22 +546,49 @@ class MAFWebAgent:
             
             async with MCPStdioTool(
                 name="playwright",
-                command="npx",
-                args=["-y", "@playwright/mcp@latest"]
+                command=self.mcp_settings.playwright_command,
+                args=self.mcp_settings.get_playwright_args()
             ) as playwright:
+                available_actions = await self._get_available_actions(playwright)
+                navigate_action = self._choose_action(
+                    available_actions,
+                    ["browser_navigate", "navigate", "goto"]
+                )
+
+                if not navigate_action:
+                    return {
+                        "success": False,
+                        "error": "Playwright MCP missing navigation capability",
+                        "from_cache": True,
+                        "cost": 0.0,
+                        "timestamp": datetime.now().isoformat()
+                    }
+
                 # Navigate
                 await self._call_mcp_tool(
                     playwright,
-                    "browser_navigate",
+                    navigate_action,
                     {"url": url}
                 )
-                
+
                 # Execute cached steps
                 results = []
-                for step in cached_pattern['steps']:
+                for step in cached_pattern.get('steps', []):
+                    action_name = self._choose_action(
+                        available_actions,
+                        [step.get('action')]
+                    )
+
+                    if not action_name:
+                        self.logger.warning(
+                            "Skipping cached step; Playwright MCP no longer exposes '%s'",
+                            step.get('action')
+                        )
+                        continue
+
                     result = await self._call_mcp_tool(
                         playwright,
-                        step['action'],
+                        action_name,
                         {"locator": step['locator']}
                     )
                     results.append(result)
@@ -561,11 +659,54 @@ class MAFWebAgent:
                 })
         
         return selectors[:3]  # Return top 3 candidates
-    
+
+    async def _get_available_actions(self, tool: MCPStdioTool) -> List[str]:
+        """Discover available tool actions at runtime."""
+        try:
+            if hasattr(tool, "list_tools"):
+                response = await tool.list_tools()
+                tools = []
+                if isinstance(response, dict):
+                    tools = response.get('tools') or response.get('items') or []
+                else:
+                    tools = response or []
+
+                action_names: List[str] = []
+                for item in tools:
+                    if isinstance(item, dict) and item.get('name'):
+                        action_names.append(item['name'])
+                    elif isinstance(item, str):
+                        action_names.append(item)
+
+                if action_names:
+                    return action_names
+        except Exception as exc:
+            self.logger.debug("Tool discovery failed: %s", exc)
+
+        fallback = getattr(tool, "tool_names", [])
+        return list(fallback)
+
+    def _choose_action(self, available: List[str], candidates: List[Optional[str]]) -> Optional[str]:
+        """Return the first candidate present in the available actions."""
+        for candidate in candidates:
+            if candidate and candidate in available:
+                return candidate
+        return None
+
+    def _action_candidates(self, action_hint: str) -> List[str]:
+        """Map logical actions to potential MCP verb names."""
+        normalized = (action_hint or '').lower()
+        mapping = {
+            'click': ["click", "browser_click", "tap", "act.click"],
+            'type': ["type", "fill", "browser_fill", "input_text", "enter_text"],
+            'submit': ["submit", "press", "press_enter", "key_press"],
+        }
+        return mapping.get(normalized, [normalized])
+
     async def _call_mcp_tool(
         self,
         tool: MCPStdioTool,
-        action: str,
+        action: Optional[str],
         params: Dict[str, Any]
     ) -> Dict[str, Any]:
         """
@@ -573,6 +714,13 @@ class MAFWebAgent:
         
         Placeholder - actual implementation would use tool's JSON-RPC interface.
         """
+        if not action:
+            return {
+                'success': False,
+                'error': 'No action provided',
+                'params': params
+            }
+
         # This would be implemented with actual MCP tool calling
         return {
             'success': True,
@@ -630,12 +778,11 @@ async def main():
     load_dotenv()
     
     redis_client = RedisClient()
-    
+
     agent = MAFWebAgent(
         api_key=os.getenv("OPENROUTER_API_KEY"),
-        openrouter_key=os.getenv("OPENROUTER_API_KEY"),
-        redis_client=redis_client,
-        model=os.getenv("MODEL", "x-ai/grok-4-fast-reasoning")
+        model=os.getenv("MODEL", "x-ai/grok-4-fast-reasoning"),
+        mcp_settings=settings.mcp
     )
     
     # Example tasks
@@ -1206,6 +1353,9 @@ HITL_COST_THRESHOLD=1.0
 MCP_PLAYWRIGHT_ENABLED=true
 MCP_PLAYWRIGHT_COMMAND=npx
 MCP_PLAYWRIGHT_ARGS=-y,@playwright/mcp@latest
+MCP_PLAYWRIGHT_CAPS=pdf,tabs
+MCP_PLAYWRIGHT_USER_DATA_DIR=.profiles/tenant-default
+MCP_PLAYWRIGHT_EXTRA_FLAGS=
 
 # Browser-Use
 MCP_BROWSER_USE_ENABLED=true
@@ -1258,20 +1408,40 @@ class BudgetSettings(BaseSettings):
 class MCPServerSettings(BaseSettings):
     """MCP server configuration"""
     model_config = SettingsConfigDict(env_prefix='MCP_')
-    
+
     playwright_enabled: bool = True
     playwright_command: str = "npx"
     playwright_args: str = "-y,@playwright/mcp@latest"
-    
+    playwright_caps: str = ""
+    playwright_user_data_dir: Optional[str] = None
+    playwright_extra_flags: str = ""
+
     browser_use_enabled: bool = True
     browser_use_command: str = "uvx"
     browser_use_args: str = "browser-use,--mcp"
-    
-    def get_playwright_args(self) -> List[str]:
-        return self.playwright_args.split(',')
-    
+
+    def get_playwright_args(self, additional_caps: Optional[List[str]] = None) -> List[str]:
+        args = [arg.strip() for arg in self.playwright_args.split(',') if arg.strip()]
+        caps = [cap.strip() for cap in self.playwright_caps.split(',') if cap.strip()]
+
+        if additional_caps:
+            for cap in additional_caps:
+                if cap and cap not in caps:
+                    caps.append(cap)
+
+        if caps:
+            args.append(f"--caps={','.join(dict.fromkeys(caps))}")
+
+        if self.playwright_user_data_dir:
+            args.extend(["--user-data-dir", self.playwright_user_data_dir])
+
+        if self.playwright_extra_flags:
+            args.extend(self.playwright_extra_flags.split())
+
+        return args
+
     def get_browser_use_args(self) -> List[str]:
-        return self.browser_use_args.split(',')
+        return [arg.strip() for arg in self.browser_use_args.split(',') if arg.strip()]
 
 
 class Settings(BaseSettings):
@@ -1323,7 +1493,8 @@ async def test_simple_navigation():
     )
     
     result = await agent.execute_task(
-        "Navigate to example.com and extract the main heading"
+        "Navigate to example.com and extract the main heading",
+        url="https://example.com"
     )
     
     assert result["success"]
@@ -1340,7 +1511,8 @@ async def test_form_interaction():
     )
     
     result = await agent.execute_task(
-        "Navigate to httpbin.org/forms/post and fill in the 'custname' field with 'Test User'"
+        "Navigate to httpbin.org/forms/post and fill in the 'custname' field with 'Test User'",
+        url="https://httpbin.org/forms/post"
     )
     
     assert result["success"]
@@ -1356,6 +1528,7 @@ async def test_streaming():
     
     result = await agent.execute_task(
         "Navigate to example.com",
+        url="https://example.com",
         stream=True
     )
     
@@ -1421,13 +1594,17 @@ Microsoft Agent Framework-based web automation agent.
 ```bash
 # 1. Install dependencies
 pip install -r requirements.txt
-playwright install chromium
+node --version  # Ensure Node.js is available for MCP servers
 
-# 2. Configure
+# 2. Launch MCP servers (separate terminals)
+npx -y @playwright/mcp@latest --caps=pdf,tabs --user-data-dir .profiles/tenant-default
+uvx browser-use --mcp
+
+# 3. Configure
 cp .env.example .env
 # Edit .env with your OPENROUTER_API_KEY
 
-# 3. Run
+# 4. Run
 python -m src.agents.maf_web_agent
 ```
 
@@ -1442,6 +1619,13 @@ MCP Tools (Playwright + Browser-Use)
     ↓
 Browser Automation
 ```
+
+### MCP Startup Commands
+
+- **Playwright MCP:** `npx -y @playwright/mcp@latest --caps=pdf,tabs --user-data-dir .profiles/tenant-default`
+- **browser-use MCP:** `uvx browser-use --mcp`
+
+Reference: [Microsoft Agent Framework MCP integration guide](https://learn.microsoft.com/en-us/azure/ai-services/agent-framework/how-to/connectors#mcp-tooling) explains how MAF brokers MCP tools.
 
 ### What's Different from Original
 
@@ -1467,4 +1651,10 @@ Browser Automation
 pytest tests/integration/ -v
 ```
 ```
+
+### Operational Nice-to-haves
+
+- **Network hygiene:** keep Playwright MCP bound to loopback during development and tighten host allow-lists in production as upstream servers expose the option (e.g., Browserbase MCP guidance).
+- **Durable sessions:** map `--user-data-dir` to tenant- or thread-specific profiles so Playwright sessions persist between runs (mirrors LobeHub recommendations).
+- **Anti-bot recovery:** when a domain hits the breaker, retry via browser-use's stealth/cloud mode before failing permanently.
 
